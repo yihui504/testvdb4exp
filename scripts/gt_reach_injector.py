@@ -20,7 +20,13 @@ Usage:
   GT_HINT=$(python scripts/gt_reach_injector.py \\
             --session-dir results/{target}/{version}/{timestamp} --text-only)
 
-gt.json format (pointed to by TESTVDB_GT_PATH):
+gt.json discovery (in order):
+  1. TESTVDB_GT_PATH env var, if set and points to an existing file (override);
+  2. results/{target}/{version}/gt.json — the conventional per-version location
+     (= session_dir's parent). The experiment groups GT bugs by (target, version)
+     and places one gt.json per version here, then runs /mine once per version.
+
+gt.json format:
   {"target": "milvus", "version": "v2.6.17",
    "bugs": [{"id": "milvus_47729", "endpoint": "search", "param": "nprobe"}, ...]}
 """
@@ -92,7 +98,13 @@ def main() -> int:
 
     gt_path = os.environ.get("TESTVDB_GT_PATH")
     if not gt_path or not os.path.isfile(gt_path):
-        return _noop(text_only)
+        # Conventional per-version location: results/{target}/{version}/gt.json
+        # (session_dir = results/{target}/{version}/{timestamp}, so its parent is
+        # the version root). Lets the experiment run /mine once per version with
+        # that version's grouped GT bugs in place — no gt_path threading needed.
+        gt_path = str(Path(session_dir).parent / "gt.json")
+        if not os.path.isfile(gt_path):
+            return _noop(text_only)
 
     try:
         gt = json.load(open(gt_path, encoding="utf-8"))
