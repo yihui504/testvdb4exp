@@ -427,6 +427,22 @@ def run_novelty_gate(session_dir: Path, github_token: Optional[str]) -> Dict:
     if not confirmed_defects:
         return {"error": "No confirmed defects found"}
 
+    if os.environ.get("TESTVDB_NOVELTY_BYPASS"):
+        # Experimental bypass (Phase 3 detection-capability experiment): the GT
+        # defects are our own submissions, so the GitHub/corpus dedup below would
+        # grade them KNOWN_OPEN and reject every candidate (reach -> 0). When the
+        # flag is set, endorse all debate-confirmed candidates without searching.
+        results = {}
+        for defect in confirmed_defects:
+            identifier = (defect.get("script") or defect.get("candidate")
+                          or defect.get("defect_id", ""))
+            results[identifier] = {
+                "grade": "NOVEL", "layer": "bypass",
+                "endorsement": True,
+                "endorsement_reason": "TESTVDB_NOVELTY_BYPASS set — dedup disabled for experiment",
+            }
+        return results
+
     consumer_data = load_consumer_data(session_dir, target)
 
     results = {}

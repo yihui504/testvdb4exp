@@ -218,11 +218,11 @@ def reconstruct(session_dir: str) -> dict[str, Any]:
     min_defects = ps.get("min_defects", 1)
 
     termination_reason = ""
-    if consecutive_no_defect >= 5:
-        termination_reason = f"僵局终止（连续 {consecutive_no_defect} 轮无新缺陷）"
-    elif overall_coverage >= 95.0:
-        termination_reason = f"覆盖率达标（{overall_coverage:.1f}% ≥ 95%）"
-    elif max_rounds > 0 and current_round > max_rounds:
+    # Experimental build: removed the "consecutive_no_defect >= 5" and
+    # "overall_coverage >= 95.0" early-stop branches. The detection-capability
+    # experiment (Phase 3) must run until the round cap so reach is not
+    # underestimated by coverage or stall heuristics. Only the round cap stops it.
+    if max_rounds > 0 and current_round > max_rounds:
         termination_reason = f"达到最大轮次（{current_round}/{max_rounds}）"
     elif min_defects > 0 and total_defects >= min_defects:
         # min_defects reached (0 = 无下限，不检查) — soft termination

@@ -3,7 +3,7 @@ name: attack-state
 description: 状态攻击 Agent — 专注于数据一致性、并发操作和状态转换违规的测试生成。
 model: sonnet
 dataAccess: redacted
-maxTurns: 300
+maxTurns: 500
 tools:
   - Read
   - Write
