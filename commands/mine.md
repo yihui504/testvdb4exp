@@ -505,6 +505,12 @@ docker ps --filter "name=testvdb-{target}" --format "{{.Names}}" 2>/dev/null
 THREAT_MODEL_ATTACK=$(python scripts/threat_model_injector.py {target} --mode attack --text-only 2>/dev/null || echo "")
 ```
 
+**GT-informed 续挖注入**（实验模式，需环境变量 `TESTVDB_GT_PATH` 指向 gt.json）：
+```bash
+GT_HINT=$(python scripts/gt_reach_injector.py --session-dir results/{target}/{version}/{timestamp} --text-only 2>/dev/null || echo "")
+```
+> 未设 `TESTVDB_GT_PATH` 时 `GT_HINT` 为空串，正常挖掘流程不受影响。注入文本只含"已确认 X/Y + 提升脚本质量/扩大覆盖/深化挖掘"的通用催促，**不含任何端点/参数/预期**（见 scripts/gt_reach_injector.py 的盲注契约）。
+
 **Judge 增强注入**（intelligence.enabled=true 且 inject_to_judge_agents=true）：
 ```bash
 THREAT_MODEL_JUDGE_SEVERITY=$(python scripts/threat_model_injector.py {target} --mode judge --judge-type severity --text-only 2>/dev/null || echo "")
@@ -518,16 +524,16 @@ THREAT_MODEL_JUDGE_EVIDENCE=$(python scripts/threat_model_injector.py {target} -
 
 ```
 Agent(subagent_type="testvdb:attack-boundary", description="边界攻击 {target} v{version}",
-  prompt="按照 agents/attack-boundary.md 规范，为 {target} v{version} 生成边界攻击脚本。contract=results/{target}/{version}/structured_contract.json, session_id={session_id}, session_dir=results/{target}/{version}/{timestamp}, reflection_context={reflection_context}。{THREAT_MODEL_ATTACK}")
+  prompt="按照 agents/attack-boundary.md 规范，为 {target} v{version} 生成边界攻击脚本。contract=results/{target}/{version}/structured_contract.json, session_id={session_id}, session_dir=results/{target}/{version}/{timestamp}, reflection_context={reflection_context}。{THREAT_MODEL_ATTACK} {GT_HINT}")
 
 Agent(subagent_type="testvdb:attack-state", description="状态攻击 {target} v{version}",
-  prompt="按照 agents/attack-state.md 规范...（同上格式）{THREAT_MODEL_ATTACK}")
+  prompt="按照 agents/attack-state.md 规范...（同上格式）{THREAT_MODEL_ATTACK} {GT_HINT}")
 
 Agent(subagent_type="testvdb:attack-semantic", description="语义攻击 {target} v{version}",
-  prompt="按照 agents/attack-semantic.md 规范...（同上格式）{THREAT_MODEL_ATTACK}")
+  prompt="按照 agents/attack-semantic.md 规范...（同上格式）{THREAT_MODEL_ATTACK} {GT_HINT}")
 
 Agent(subagent_type="testvdb:attack-vein", description="Vein-mining 纵深攻击 {target} v{version}",
-  prompt="按照 agents/attack-vein.md 规范，为 {target} v{version} 做 condition-space 纵深挖掘。contract=results/{target}/{version}/structured_contract.json, threat_model=intelligence/{target}/threat_model.json, session_id={session_id}, session_dir=results/{target}/{version}/{timestamp}。**自己跑脚本**（curl 真 DB via Bash，DB URL 从 TESTVDB_DB_URL 环境变量读），single-turn discover-then-deepen 按 condition-richness 评分选 top-3 endpoint，纵深挖掘 8 类通用 condition（range_filter / compound_and / compound_or / geo_filter / null_check / type_mismatch / collection_membership / pagination_cursor），finding-feedback loop 启发相邻 condition。产出 results/{target}/{version}/{timestamp}/vein_scripts/*.py（strategy=vein_<type>，走标准 Stage 1+2+Judge）+ vein_state.json（finding 链）+ vein_summary.json。")
+  prompt="按照 agents/attack-vein.md 规范，为 {target} v{version} 做 condition-space 纵深挖掘。contract=results/{target}/{version}/structured_contract.json, threat_model=intelligence/{target}/threat_model.json, session_id={session_id}, session_dir=results/{target}/{version}/{timestamp}。**自己跑脚本**（curl 真 DB via Bash，DB URL 从 TESTVDB_DB_URL 环境变量读），single-turn discover-then-deepen 按 condition-richness 评分选 top-3 endpoint，纵深挖掘 8 类通用 condition（range_filter / compound_and / compound_or / geo_filter / null_check / type_mismatch / collection_membership / pagination_cursor），finding-feedback loop 启发相邻 condition。产出 results/{target}/{version}/{timestamp}/vein_scripts/*.py（strategy=vein_<type>，走标准 Stage 1+2+Judge）+ vein_state.json（finding 链）+ vein_summary.json。 {GT_HINT}")
 ```
 
 > **attack-vein 是第 4 个 attack agent**（v2.5，与 boundary/state/semantic 并存）：
