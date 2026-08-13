@@ -1,0 +1,861 @@
+---
+description: 启动向量数据库自动化缺陷挖掘流水线
+allowed-tools: Read, Write, Bash, Grep, Glob, Agent
+---
+
+# /testvdb:mine
+
+启动向量数据库自动化缺陷挖掘流水线。
+
+---
+
+## ⚠️ 架构约束（CRITICAL — 技术原因）
+
+**Claude Code 插件体系的技术限制：子 Agent 无法可靠地嵌套派发孙 Agent。**
+
+这意味着：
+- ✅ 主进程 → `testvdb:knowledge-extractor`（可以——主进程直接派发）
+- ✅ 主进程 → `testvdb:orchestrator`（可以——但 orchestrator 内部派发孙 Agent 不可靠）
+- ❌ orchestrator(子) → `testvdb:knowledge-extractor`(孙)（不可靠——agent_type 会被丢失为 "unknown"）
+
+**因此本命令的设计：主进程直接担任编排者角色，按照 `agents/orchestrator.md` 的 SOP 逐步派发子 Agent。**
+`testvdb:orchestrator` 的 agent 定义保留为 SOP 参考文档。
+
+---
+
+## ⛔ 核心铁律
+
+**主进程永远只做编排，不做执行。违反任何一条流水线立即故障。**
+
+| 禁止事项 | 正确做法 |
+|---------|---------|
+| ❌ 使用 WebSearch/WebFetch 爬取文档 | ✅ `Agent(subagent_type="testvdb:knowledge-extractor")` |
+| ❌ 自己生成 structured_contract.json | ✅ `Agent(subagent_type="testvdb:contract-formalizer")` |
+| ❌ 自己写 Python 攻击脚本 | ✅ `Agent(subagent_type="testvdb:attack-boundary/state/semantic")` |
+| ❌ 自己运行 Python 脚本或 curl | ✅ `Agent(subagent_type="testvdb:docker-executor")` |
+| ❌ 自己判断缺陷有效性 | ✅ `Agent(subagent_type="testvdb:judge-*")` |
+| ❌ 自己生成缺陷报告 | ✅ `Agent(subagent_type="testvdb:reporter")` |
+
+**主进程只使用这些工具做编排工作：** `Read`(读文件), `Write`(写状态文件), `Bash`(验证产出), `Grep`(搜索), `Glob`(匹配), `Agent`(派发子Agent)。跨 turn 由 Stop hook（`pipeline_gate.py`）驱动，主进程无需调度工具。
+
+> **⚠️ 派发工具纪律（CRITICAL — 避免重犯历史错误）**：派发 `testvdb:*` 子 Agent **只能用 `Agent(subagent_type="testvdb:xxx", ...)`**。
+> - ❌ **禁止用 `TaskCreate`**：它不识别 plugin agent_type，派发记录为 `Spawning agent: unknown (inherit)`，任务永久 `pending`（幽灵条目，`TaskStop` 也删不掉），**背后无真实 agent 执行**。
+> - ✅ `Agent(subagent_type=...)` 是**核心内置工具**——无需 `ToolSearch` 加载（ToolSearch 只索引 deferred 工具清单，**搜不到 ≠ 不可用**），直接调用即可。
+> - ✅ 非 v2.1.166 regression 环境下 plugin subagent 真实可用（2026-06-17 实测：reporter-mre 派发成功，weaviate 3 confirmed defect 产出 `mre/*.done`）。
+> - `TaskCreate`/`TaskList` 等仅用于 OMC 任务追踪，**不派 plugin agent**。探针派发能力也只用 `Agent(subagent_type=...)`，别用 TaskCreate 探针。
+
+---
+
+## Usage
+
+```
+/testvdb:mine <db> <version> [--max-rounds N] [--min-defects N]
+```
+
+## Parameters
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `<db>` | Yes | — | `milvus`, `qdrant`, `weaviate`, `pgvector`, `meilisearch`, 或 `chroma` |
+| `<version>` | Yes | — | 目标版本号 |
+| `--max-rounds N` | No | `5` | 最大挖掘轮数。`0` = 无上限 |
+| `--min-defects N` | No | `1` | 最低缺陷产出要求 |
+| `--intel true\|false` | No | `auto` | 情报阶段控制。`true`=强制重新采集；`false`=禁用采集（C 边界：无情报→报错，有但过期→用+警告）；不传=`auto`（缓存有效→复用，否则采集） |
+| `--contract true\|false` | No | `auto` | 契约阶段控制。`true`=强制重新生成；`false`=禁用生成（C 边界：无契约→报错，有但过期→用+警告）；不传=`auto`（缓存有效→复用，否则生成） |
+| `--new` | No | — | 强制新建会话，忽略未完成运行的自动 RESUME（旧中断废弃时用） |
+
+---
+
+## 执行模型：Stop hook 驱动的跨 Turn Loop
+
+> **📖 完整 SOP 参考**: `agents/orchestrator.md`（阶段详解、投票规则、错误处理）、`skills/pipeline/SKILL.md`（六阶段流水线规范）。本文件只保留编排调度命令，不重复 SOP 描述。
+
+本命令采用 **Stop hook 驱动的跨 Turn 迭代模型**（`scripts/hooks/pipeline_gate.py` 接入 `.claude/settings.local.json` 的 Stop hook，参考 ralph "boulder never stops"）。每轮挖掘是一个独立的 Turn：
+
+```
+Turn 1 (FRESH_START):  Step 1-7 (setup) + Round 1 (8a→8j) + 更新 state → 主动结束 turn
+                          ↓ Stop hook: phase != DONE → exit 2 → harness 强制新 turn
+Turn N (RESUME):       reconstruct_context.py → Round N (8a→8j) + 更新 state → 主动结束 turn
+                          ↓ （同上）
+Final Turn:            终止条件满足 → phase=DONE → Stop hook 放行(exit 0) → Step 9-10
+```
+
+**机制**：主进程每轮结束更新 `pipeline_state.json`（`phase=ROUND_START`, `current_round+1`）后**主动结束 turn**。harness 的 Stop hook 调用 `pipeline_gate.py`：
+- `phase != DONE` → `exit 2`（强制 Claude 新 turn 继续）
+- `phase == DONE` + quality gate 通过 → `exit 0`（允许停止）
+
+**状态持久化**：`pipeline_state.json`（v3 schema）是跨 Turn 的唯一状态源。每个 phase 完成后立即更新，确保断点恢复精确到步骤。
+
+> ⚠️ **autoCompact 必需**：跨 turn 循环依赖 `~/.claude/settings.json` 的 `autoCompactEnabled: true`（每个 turn 间压缩 context）。preflight 会检查并警告。
+
+---
+
+## 执行入口
+
+### 入口判断
+
+每次 Turn 开始时，首先执行入口判断。**主进程：若 `/mine` 命令行含 `--new`，执行下面的脚本前先 `export TESTVDB_FORCE_NEW=1`**（force_new 强制 FRESH_START，并清残留 `.resume_target` 标记）。
+
+```bash
+python -c "
+import sys, os, json
+# 锁定插件根（与 Step 1 同逻辑，防 cwd 漂移）
+root = os.environ.get('TESTVDB_PLUGIN_ROOT', '')
+if not (root and os.path.isdir(root)):
+    cur = os.getcwd()
+    for _ in range(7):
+        if os.path.isfile(os.path.join(cur, 'commands', 'mine.md')):
+            root = cur; break
+        parent = os.path.dirname(cur)
+        if parent == cur: break
+        cur = parent
+if not root:
+    print(json.dumps({'decision':'FRESH_START','reason':'no plugin root'}, ensure_ascii=False)); sys.exit(0)
+os.chdir(root)
+sys.path.insert(0, os.path.join(root, 'scripts'))
+import _entry_dispatch as ed
+# 入口判断：扫描所有未完成（loop+setup）续最新；--new 强制新建；resume 命令的 .resume_target 标记优先
+result = ed.dispatch('', '', force_new=os.environ.get('TESTVDB_FORCE_NEW') == '1')
+print(json.dumps(result, ensure_ascii=False))
+"
+```
+
+读取 dispatch 结果 JSON：
+- `decision=RESUME`（含 `session_dir`/`phase`/`target`/`version`）→ 从 `session_dir` 执行 [Loop Turn: Resume Round](#loop-turn-resume-round)
+  - 若 `target`/`version` 与本次 `/mine <db> <version>` 请求不符（Turn 1 场景）→ 输出提示："最新未完成是 `{target}/{version}`，与请求 `{db}/{version}` 不符；续它还是新建？建议 `/testvdb:resume {session_id}` 或加 `--new`"
+- `decision=FRESH_START` → 执行 [Turn 1: Setup + First Round](#turn-1-setup--first-round)
+  - 若 `incomplete` 非空（同 target/version 有未完成）→ 输出提示："检测到未完成 `{session_id}`（`{phase}`），建议 `/testvdb:resume {session_id}`；已新建会话（如需续旧的请用 resume）"
+
+> **`--new`**：主进程解析到 `--new` 时，入口判断前 `export TESTVDB_FORCE_NEW=1`（force_new=True 强制 FRESH_START，仍返回 `incomplete` 供知情）。
+> **派发纪律**：续跑实质工作仍经 `Agent(subagent_type=...)`，禁用 `TaskCreate`（见本文件「派发工具纪律」）。
+
+---
+
+## Turn 1: Setup + First Round
+
+> 仅在 FRESH_START 时执行。完成所有初始化工作后进入第一轮挖掘。
+
+### Step 1: 解析参数
+- 验证 `target` ∈ {milvus, qdrant, weaviate, pgvector, meilisearch, chroma}
+- 解析 `version`, `max_rounds`, `min_defects`
+- **version 规范化**：统一为 `vX.Y.Z`（用户传 `1.38.0` 或 `v1.38.0` 都归一为 `v1.38.0`），用于 session_id 和 `results/{target}/{version}/` 目录名——历史曾出现 `2.6.17`/`1.38.0`(不带v) 与 `v1.18.2`(带v) 混用，导致脚本按一种格式找不到另一种格式的产出：
+```bash
+version="${version#v}"   # 去掉可能的前缀 v
+version="v${version}"    # 统一加回 v 前缀
+```
+- 确定 `PROJECT_ROOT`（**禁止用 `git rev-parse --show-toplevel`**：用户主目录 `~/` 本身是 git 仓库，在父目录启动 claude 时它会漂移到 `~/`，导致 `results/` 写错根——这是历史目录错位的根因）：
+```bash
+# 校验式锁定：必须是含 commands/mine.md 的 testvdb 插件根
+PROJECT_ROOT="${TESTVDB_PLUGIN_ROOT:-}"
+if [ -z "$PROJECT_ROOT" ] || [ ! -f "$PROJECT_ROOT/commands/mine.md" ]; then
+  cur="$PWD"
+  for _ in 1 2 3 4 5 6; do
+    [ -f "$cur/commands/mine.md" ] && PROJECT_ROOT="$cur" && break
+    cur="$(dirname "$cur")"
+  done
+fi
+if [ -z "$PROJECT_ROOT" ] || [ ! -f "$PROJECT_ROOT/commands/mine.md" ]; then
+  echo "FATAL: 找不到 testvdb 插件根（含 commands/mine.md）。请在 TestVDB 目录启动，或设 TESTVDB_PLUGIN_ROOT。"; exit 1
+fi
+cd "$PROJECT_ROOT"          # 锁定 cwd，后续所有相对路径 results/... 一律相对此根
+export TESTVDB_PLUGIN_ROOT="$PROJECT_ROOT"   # 供 hook 脚本（_session_utils/pipeline_gate）读取
+echo "[TestVDB] PROJECT_ROOT=$PROJECT_ROOT"
+```
+
+### Step 2: 前置条件检查
+自行检查 Docker/Python/磁盘/网络：
+```bash
+python scripts/preflight.py
+# 按 target 设容器版本 env（避免 compose 默认旧版本，如 chroma 0.6.3 导致 mine 1.5.9 时 server 版本不匹配 scripts API）
+# image tag 格式 per-target：chroma/weaviate 不带 v（1.5.9），milvus/qdrant 带 v（v2.4.0）
+case "$TARGET" in
+  chroma)    export CHROMA_VERSION="${VERSION#v}" ;;
+  milvus)    export MILVUS_VERSION="$VERSION" ;;
+  qdrant)    export QDRANT_VERSION="$VERSION" ;;
+  weaviate)  export WEAVIATE_VERSION="${VERSION#v}" ;;
+esac
+docker compose -f docker/crawl4ai.yml up -d --wait 2>/dev/null || true
+```
+
+**自动压缩检查**：
+```bash
+python -c "
+import json, sys, os
+settings_path = os.path.expanduser('~/.claude/settings.json')
+try:
+    with open(settings_path, encoding='utf-8') as f:
+        s = json.load(f)
+    if s.get('autoCompactEnabled'):
+        print('[Preflight] autoCompactEnabled: OK')
+    else:
+        print('[Preflight] autoCompactEnabled: MISSING — 多轮流水线会因上下文溢出而中断(这是 compact 后从头开始的根因之一)')
+        print('[Preflight] 修复: 在 ~/.claude/settings.json 设置 "autoCompactEnabled": true')
+        if os.environ.get('TESTVDB_ALLOW_NO_AUTOCOMPACT') == '1':
+            print('[Preflight] TESTVDB_ALLOW_NO_AUTOCOMPACT=1 → 继续运行(风险自负,单轮可用)')
+        else:
+            print('[Preflight] 中止。设 TESTVDB_ALLOW_NO_AUTOCOMPACT=1 可强制继续。')
+            sys.exit(1)
+except FileNotFoundError:
+    print('[Preflight] ~/.claude/settings.json 不存在，跳过 autoCompact 检查')
+except json.JSONDecodeError:
+    print('[Preflight] settings.json 格式错误，跳过 autoCompact 检查')
+"
+```
+
+### Step 3: 契约智能消费（批次 D，D 判断）
+
+按 `--contract` 参数决定契约阶段行为（spec 决策 4：存在→TTL→有效性→target/version 匹配）。逻辑与 `/testvdb:contract` 命令相同。
+
+**智能判断（不传 `--contract`，默认 auto）**：
+```bash
+python scripts/check_cache.py contract "results/{target}/{version}" {target} {version} --ttl {knowledge.cache_ttl_hours}
+```
+- **USABLE**（exit 0）→ 跳过契约生成，直接 [Step 7](#step-7-初始化状态)（纯挖掘）
+- **MISSING / STALE / INVALID** → 派发契约生成（Step 4 → Step 5 → Step 6）
+- **MISMATCH**（target/version 不匹配）→ 报错退出
+
+**`--contract true`**：跳过 check_cache，强制派发 Step 4 → Step 5 → Step 6（重新生成）
+
+**`--contract false`（C 边界）**：
+- **MISSING** → 报错退出（"契约缺失，--contract false 跳过生成；请先 `/testvdb:contract {target} {version}`"）
+- **STALE / INVALID** → 用现有契约 + 警告（"契约可能过期/无效，--contract false 跳过刷新"），继续 Step 7
+- **USABLE** → 正常使用
+
+**Passport Hash 验证**（`material_passport.enabled=true` 且契约阶段执行了 Step 4-5 时）：
+```bash
+python scripts/passport_verify.py "results/{target}/{version}/structured_contract.json"
+```
+
+### Step 3.5: 跨会话策略注入准备（evolution.enabled=true 时）
+
+读取 Strategy Registry：
+```bash
+python scripts/strategy_injector.py {target} --text-only
+```
+
+### Step 3.6: 历史情报采集（intelligence.enabled=true 时）
+
+**⛔ 铁律：主进程只做编排，不做执行。**
+
+如果 `intelligence.enabled=false`，跳过整个 Step 3.6。
+
+**读取 intelligence 配置**：
+```bash
+python -c "
+import json
+with open('settings.json', encoding='utf-8') as f:
+    c = json.load(f).get('intelligence', {})
+print(f'INTEL_TW={c.get(\"time_window_months\", 24)}')
+print(f'INTEL_MI={c.get(\"max_issues\", 500)}')
+print(f'INTEL_MC={c.get(\"max_commits\", 200)}')
+print(f'INTEL_TTL={c.get(\"cache_ttl_hours\", 720)}')
+"
+```
+
+#### 3.6a: 情报智能消费（批次 D，D 判断）
+
+按 `--intel` 参数决定情报阶段行为（spec 决策 4：存在→TTL→有效性）。逻辑与 `/testvdb:intel` 命令相同。
+
+**智能判断（不传 `--intel`，默认 auto）**：
+```bash
+python scripts/check_cache.py intel "intelligence/{target}" {target} --ttl {INTEL_TTL}
+```
+- **USABLE**（exit 0）→ 跳过情报采集，直接 [3.6e](#36e-加载情报摘要)（纯挖掘）
+- **MISSING / STALE / INVALID** → 派发情报采集（3.6b → 3.6c → 3.6d）
+- **MISMATCH** → 报错退出
+
+**`--intel true`**：跳过 check_cache，强制派发 3.6b → 3.6c → 3.6d（重新采集）
+
+**`--intel false`（C 边界）**：
+- **MISSING** → 报错退出（"情报缺失，--intel false 跳过采集；请先 `/testvdb:intel {target}`"）
+- **STALE / INVALID** → 用现有情报 + 警告（"情报可能过期/无效，--intel false 跳过刷新"），继续 3.6e
+- **USABLE** → 正常使用
+
+#### 3.6b: 派发 issue-miner
+```
+Agent(subagent_type="testvdb:issue-miner", description="采集 {target} 历史 Issues 和 Commits",
+  prompt="按照 agents/issue-miner.md 规范，为 {target} 采集历史 Issues 和已合并修复 PR。输入参数: target={target}, version={version}, intelligence_dir=intelligence/{target}/, time_window_months={INTEL_TW}, max_issues={INTEL_MI}, max_commits={INTEL_MC}。将结果写入 intelligence/{target}/issue_corpus.json 和 intelligence/{target}/commit_corpus.json。")
+```
+如果失败 → 记录警告，跳过后续 3.6c/3.6d。
+
+#### 3.6c: 派发 bug-shape-extractor
+```
+Agent(subagent_type="testvdb:bug-shape-extractor", description="提取 {target} 历史 Bug Shapes",
+  prompt="按照 agents/bug-shape-extractor.md 规范，对 intelligence/{target}/issue_corpus.json 和 intelligence/{target}/commit_corpus.json 进行分类和根因模式提取。将结果写入 intelligence/{target}/classified_issues.json、bug_shapes.json、developer_cognition.json。")
+```
+
+#### 3.6d: 派发 threat-modeler
+```
+Agent(subagent_type="testvdb:threat-modeler", description="构建 {target} 威胁模型",
+  prompt="按照 agents/threat-modeler.md 规范，基于 bug_shapes.json、classified_issues.json、developer_cognition.json 构建威胁模型。将结果写入 intelligence/{target}/threat_model.json。")
+```
+
+#### 3.6e: 加载情报摘要
+```bash
+python -c "
+import json
+with open('intelligence/{target}/threat_model.json', encoding='utf-8') as f:
+    tm = json.load(f)
+print(json.dumps({
+    'blindspot_count': len(tm.get('cognitive_blindspots', {}).get('blindspots', [])),
+    'high_priority_areas': [a['area'] for a in tm.get('attack_surface', {}).get('high_priority_areas', [])],
+    'top_blindspots': [b['blindspot_id'] for b in tm.get('cognitive_blindspots', {}).get('blindspots', [])[:3]],
+}, indent=2, ensure_ascii=False))
+" 2>/dev/null || echo "THREAT_MODEL_NOT_AVAILABLE"
+```
+
+### Step 4: 派 Knowledge Extractor（Task 4a：失败时复用+标记）
+
+> **P3-20 glm proxy 模式（env 标志提前触发）**：preflight `check_glm_proxy` 检测 `TESTVDB_PROXY=glm` env 标志后，pipeline 启动时即知 glm proxy 环境 → knowledge-extractor 直接走 Task 4a fallback（省去 Stop hook 重试 N 次才降级）。标准代理环境仍按"agent 失败后"路径触发。glm proxy 环境用户在 SessionStart 前设 `TESTVDB_PROXY=glm`。
+
+```
+# 先检查是否有旧版本 knowledge 可复用
+OLD_VERSION=$(find results/{target} -maxdepth 2 -name "raw_knowledge.md" -printf "%T@ %p\n" 2>/dev/null | sort -rn | head -1 | cut -d" " -f2- | sed 's|/raw_knowledge.md||')
+
+if [ -n "$OLD_VERSION" ] && [ -f "$OLD_VERSION/raw_knowledge.md" ]; then
+  OLD_VER=$(basename "$OLD_VERSION" | sed 's/^v//')
+  echo "[Knowledge Extractor] 降级：复用旧版本 v${OLD_VER} knowledge（glm proxy 下 agent 频繁 HTTP 400）"
+  # Task 4a: 复用旧版本 + 强制标记
+  cp "$OLD_VERSION/raw_knowledge.md" "results/{target}/{version}/raw_knowledge.md"
+  # 标记 KNOWLEDGE_DEGRADED（后续写入 mine_state.json）
+  export KNOWLEDGE_DEGRADED="true"
+  export OLD_KNOWLEDGE_VERSION="$OLD_VER"
+else
+  # 无旧版本可复用，正常派发
+  Agent(subagent_type="testvdb:knowledge-extractor", description="提取 {target} {version} 文档知识",
+    prompt="按照 agents/knowledge-extractor.md 规范，为 {target} {version} 提取 API 文档知识。将结果写入 results/{target}/{version}/raw_knowledge.md")
+
+  # 派发后检查是否成功（检查 raw_knowledge.md 是否被创建/更新）
+  if [ ! -f "results/{target}/{version}/raw_knowledge.md" ] || [ ! -s "results/{target}/{version}/raw_knowledge.md" ]; then
+    echo "[Knowledge Extractor] 失败：无法提取 knowledge，且无旧版本可复用"
+    exit 1
+  fi
+fi
+```
+
+**验证：** `ls -la results/{target}/{version}/raw_knowledge.md`
+
+**Task 4a：如果复用旧版本，在 Step 7 写入 mine_state.json 时标记 `KNOWLEDGE_DEGRADED`**：
+```python
+if os.environ.get("KNOWLEDGE_DEGRADED") == "true":
+    mine_state["knowledge_degraded"] = {
+        "reused_from": os.environ.get("OLD_KNOWLEDGE_VERSION"),
+        "reason": "knowledge-extractor agent failed (glm proxy HTTP 400)",
+        "error_log": "Agent 派发失败或超时，复用旧版本 knowledge 契约可能过时"
+    }
+```
+
+### Step 5: 派 Contract Formalizer
+```
+Agent(subagent_type="testvdb:contract-formalizer", description="形式化 {target} v{version} API 契约",
+  prompt="按照 agents/contract-formalizer.md 规范，将 results/{target}/{version}/raw_knowledge.md 转换为 structured_contract.json。将结果写入 results/{target}/{version}/structured_contract.json")
+```
+**验证：** `ls -la results/{target}/{version}/structured_contract.json`
+
+### Step 6: 合同门控检查
+检查 `structured_contract.json` 的核心 CRUD 端点覆盖率 ≥ 90%。不通过 → 输出缺失端点 + 终止。
+
+**Passport Hash 验证**（material_passport.enabled=true 时）：
+```bash
+python scripts/passport_verify.py "results/{target}/{version}/structured_contract.json"
+```
+
+### Step 7: 初始化状态
+
+- 生成 `session_id`: `{target}-{version_short}-{counter}`（sanitize: `[a-z0-9-]`，≤63字符）
+- **生成 TIMESTAMP（单一权威入口）**：后续所有 `{timestamp}` 一律引用此变量，禁止 ad-hoc 生成——历史曾出现 ISO `2026-06-06T14-26-53Z` / 紧凑T `20260611T013818` / 紧凑- `20260614-173709` 三种格式混用，根因即无统一入口。格式定为 `YYYY-MM-DDTHH-MM-SSZ`（ISO 风格、冒号→破折号、NTFS 安全、字典序可排序）：
+```bash
+TIMESTAMP="$(python -c "from datetime import datetime,timezone;print(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ'))")"
+SESSION_DIR="results/${target}/${version}/${TIMESTAMP}"
+mkdir -p "$SESSION_DIR"
+export TESTVDB_TIMESTAMP="$TIMESTAMP" TESTVDB_SESSION_DIR="$SESSION_DIR"
+echo "[TestVDB] TIMESTAMP=$TIMESTAMP SESSION_DIR=$SESSION_DIR"
+```
+- 创建 session 目录 `$SESSION_DIR`（即 `results/{target}/{version}/{TIMESTAMP}/`）
+- 写入 `mine_state.json` 和 `.session.lock`
+- **通过 CLI 初始化 `pipeline_state.json`（v3 schema, ADR-0004）**：
+
+```bash
+python scripts/pipeline_state.py init \
+    --target "{target}" \
+    --version "{version}" \
+    --session-dir "$SESSION_DIR" \
+    --max-rounds {max_rounds} \
+    --min-defects {min_defects} \
+    --project-root "{PROJECT_ROOT}"
+```
+
+> 等价于以下 v3 schema JSON（供参考，无需手写）：
+
+```python
+# pipeline_state.json v3 — 跨 Turn 状态机
+{
+    "version": 3,
+    "session_id": "{session_id}",
+    "target": "{target}",
+    "version_target": "{version}",
+    "current_round": 1,
+    "max_rounds": {max_rounds},
+    "min_defects": {min_defects},
+    "phase": "ROUND_START",
+    "phase_step_index": 0,
+    "turn_type": "setup",
+    "project_root": "{PROJECT_ROOT}",
+    "session_dir": "results/{target}/{version}/{TIMESTAMP}",
+    "timestamp_dir": "{TIMESTAMP}",
+    "phases_completed": [],
+    "phase_data": {},
+    "global_state": {
+        "total_defects_confirmed": 0,
+        "consecutive_no_defect_rounds": 0,
+        "overall_coverage_pct": 0.0,
+        "docker_container_running": False
+    },
+    "error_log": [],
+    "timestamps": {
+        "session_started": "{ISO_8601}",
+        "last_phase_change": "{ISO_8601}"
+    }
+}
+```
+
+- 设置环境变量：`export TESTVDB_SESSION_ID="{session_id}"`
+
+### Step 8: 第一轮挖掘 (Round 1)
+
+> **第一轮直接在 Turn 1 内执行，不跨 Turn。** 从 [执行一轮完整挖掘](#执行一轮完整挖掘) 开始。
+>
+> 完成后：
+> - 如果满足终止条件 → 直接在当前 Turn 执行 [Final Turn: Cleanup](#final-turn-cleanup)
+> - 如果继续 → 更新 `pipeline_state.json`：先 `advance --phase ROUND_START`（含 STATE_SAVE → ROUND_START transition），再 `mutate --current-round {N+1}`，然后**主动结束当前 turn**（不调用任何调度工具）。
+
+Stop hook（`scripts/hooks/pipeline_gate.py`）检测 `phase != DONE` → `exit 2` → harness 自动开启新 turn。新 turn 的入口判断识别 `turn_type=loop` 进入 [Loop Turn: Resume Round](#loop-turn-resume-round)。
+
+> **不使用 ScheduleWakeup**——它在非 `/loop` runtime 环境（如 glm proxy）gate 关闭不可用。Stop hook `exit 2` 是可靠的跨 turn 驱动力（参考 ralph "boulder never stops"）。
+
+---
+
+## Loop Turn: Resume Round
+
+> 在 Stop hook `exit 2` 强制的新 turn 执行（主进程结束 turn 后，pipeline_gate 检测 `phase != DONE` → `exit 2` → harness 重启 turn）。从磁盘重建上下文，继续下一轮挖掘。
+
+### Phase 0: 上下文重建
+
+1. **运行上下文重建脚本**：
+```bash
+python scripts/reconstruct_context.py --session-dir "{session_dir}" --format text
+```
+
+2. **从输出中提取关键信息**：
+   - 当前 phase（如果轮内压缩发生在某个 phase 中间，从该 phase 继续）
+   - 已完成的 phases（跳过，不要重做）
+   - 本轮关键信息（reflection_context、高价值端点等）
+   - 全局进度（总缺陷数、覆盖率）
+
+3. **检查 Docker 容器状态**：
+```bash
+docker ps --filter "name=testvdb-{target}" --format "{{.Names}}" 2>/dev/null
+```
+如果容器不在运行但 `global_state.docker_container_running` 为 true → 执行 `docker restart` 或重新启动。
+
+### Phase 1: 执行挖掘
+
+根据 `phases_completed` 列表，从第一个未完成的 phase 开始执行 [执行一轮完整挖掘](#执行一轮完整挖掘)。
+
+**断点恢复规则**：
+- 如果 `phases_completed` 包含 `ROUND_START` 但不含 `ATTACK_GEN` → 从 ATTACK_GEN 开始
+- 如果 `phases_completed` 包含 `ATTACK_GEN` 但不含 `DEBATE_S1` → 从 DEBATE_S1 开始（脚本已生成，直接收集）
+- 以此类推。每个已完成的 phase 的产出文件已持久化到磁盘，直接使用。
+
+### Phase 2: 轮次结束
+
+- 如果满足终止条件 → 执行 [Final Turn: Cleanup](#final-turn-cleanup)
+- 如果继续 → 更新 `pipeline_state.json`（`current_round` += 1，`phase` = `"ROUND_START"`，`phases_completed` = []），然后**结束 turn**。Stop hook 触发下一轮（同 Step 8 末尾机制）。
+
+---
+
+## 执行一轮完整挖掘
+
+> 这是 Step 8 的子步骤。Turn 1 的 Round 1 和 Loop Turn 的 Round N 都执行此流程。
+> 每个子步骤完成后**必须**更新 `pipeline_state.json` 的 `phase`、`phases_completed`、`phase_data`。
+
+每轮开始前：如果是第一轮，创建 `results/{target}/{version}/{timestamp}/` 目录结构。
+
+### 8a. ROUND_START — 注入 reflection_context + threat_model
+
+**更新 pipeline_state**: `phase` = `"ATTACK_GEN"`, `phases_completed` 追加 `"ROUND_START"`
+
+第一轮：无 reflection_context。后续轮次注入上轮经验。
+
+**reflection_context 结构**：
+```json
+{
+  "key_learnings": ["...", "..."],
+  "rejection_patterns": [{"endpoint": "...", "reason": "..."}],
+  "high_value_endpoints": ["..."],
+  "exhausted_endpoints": ["..."],
+  "last_round_summary": "..."
+}
+```
+
+**跨会话策略注入**（evolution.enabled=true）：`python scripts/strategy_injector.py {target} --text-only`
+
+**威胁模型注入**（intelligence.enabled=true 且 inject_to_attack_agents=true）：
+```bash
+THREAT_MODEL_ATTACK=$(python scripts/threat_model_injector.py {target} --mode attack --text-only 2>/dev/null || echo "")
+```
+
+**Judge 增强注入**（intelligence.enabled=true 且 inject_to_judge_agents=true）：
+```bash
+THREAT_MODEL_JUDGE_SEVERITY=$(python scripts/threat_model_injector.py {target} --mode judge --judge-type severity --text-only 2>/dev/null || echo "")
+THREAT_MODEL_JUDGE_NOVELTY=$(python scripts/threat_model_injector.py {target} --mode judge --judge-type novelty --text-only 2>/dev/null || echo "")
+THREAT_MODEL_JUDGE_EVIDENCE=$(python scripts/threat_model_injector.py {target} --mode judge --judge-type evidence --text-only 2>/dev/null || echo "")
+```
+
+### 8b. ATTACK_GEN — 并发出动 Attack Trio + Explorer
+
+**⛔ 绝对禁止：主进程自己生成攻击脚本。必须通过 Agent 工具派发。**
+
+```
+Agent(subagent_type="testvdb:attack-boundary", description="边界攻击 {target} v{version}",
+  prompt="按照 agents/attack-boundary.md 规范，为 {target} v{version} 生成边界攻击脚本。contract=results/{target}/{version}/structured_contract.json, session_id={session_id}, session_dir=results/{target}/{version}/{timestamp}, reflection_context={reflection_context}。{THREAT_MODEL_ATTACK}")
+
+Agent(subagent_type="testvdb:attack-state", description="状态攻击 {target} v{version}",
+  prompt="按照 agents/attack-state.md 规范...（同上格式）{THREAT_MODEL_ATTACK}")
+
+Agent(subagent_type="testvdb:attack-semantic", description="语义攻击 {target} v{version}",
+  prompt="按照 agents/attack-semantic.md 规范...（同上格式）{THREAT_MODEL_ATTACK}")
+
+Agent(subagent_type="testvdb:attack-vein", description="Vein-mining 纵深攻击 {target} v{version}",
+  prompt="按照 agents/attack-vein.md 规范，为 {target} v{version} 做 condition-space 纵深挖掘。contract=results/{target}/{version}/structured_contract.json, threat_model=intelligence/{target}/threat_model.json, session_id={session_id}, session_dir=results/{target}/{version}/{timestamp}。**自己跑脚本**（curl 真 DB via Bash，DB URL 从 TESTVDB_DB_URL 环境变量读），single-turn discover-then-deepen 按 condition-richness 评分选 top-3 endpoint，纵深挖掘 8 类通用 condition（range_filter / compound_and / compound_or / geo_filter / null_check / type_mismatch / collection_membership / pagination_cursor），finding-feedback loop 启发相邻 condition。产出 results/{target}/{version}/{timestamp}/vein_scripts/*.py（strategy=vein_<type>，走标准 Stage 1+2+Judge）+ vein_state.json（finding 链）+ vein_summary.json。")
+```
+
+> **attack-vein 是第 4 个 attack agent**（v2.5，与 boundary/state/semantic 并存）：
+> - 策略差异：boundary/state/semantic 是 shape-driven 横向枚举（shape × 同类参数）；vein 是 condition-driven 纵深挖掘（同 endpoint × 多 condition 类型）
+> - 工作模式差异：老三套只生成脚本交 Stage 1/2；vein **自己跑 curl** 得即时反馈做 single-turn discover-then-deepen，但仍产 .py 走标准 Stage 1+2+Judge
+> - 输入差异：老三套消费 contract + reflection_context（含 bug-shape）；vein 消费 contract + threat_model（**不依赖 bug-shape**，自算 condition-richness）
+> - 不替代老三套，是互补 — vein 把 count cardinality 类 novel TP（6 个历史人工挖的）合法化为流水线产出
+
+**验证产出**：
+```bash
+# 老三套的脚本产出
+ls results/{target}/{version}/{timestamp}/debate_logs/*.py 2>/dev/null | wc -l
+# vein 的 candidate 产出
+ls results/{target}/{version}/{timestamp}/vein_scripts/*.py 2>/dev/null | wc -l
+cat results/{target}/{version}/{timestamp}/vein_summary.json 2>/dev/null | python -c "import json,sys; d=json.load(sys.stdin); print(f'vein: top_endpoints={d[\"top_endpoints\"]}, candidates={d[\"candidates_count\"]}, skipped={d[\"skipped_count\"]}')"
+```
+
+**更新 pipeline_state**: `phase` = `"DEBATE_S1"`, `phases_completed` 追加 `"ATTACK_GEN"`, `phase_data.ATTACK_GEN` = `{scripts_generated: N, agents_completed: [...], vein_candidates: M}`
+
+### 8c. DEBATE_S1 — 辩论 Stage 1
+
+主进程自行执行自动化审查（编排协调工作）：
+
+1. 收集脚本 → 自动去重（endpoint + constraint_id + strategy）
+2. 语法验证（`python -m py_compile`）
+3. 约束存在性验证
+4. 脚本错误启发式检测：`python scripts/detect_risky_scripts.py "results/{target}/{version}/{timestamp}"`
+5. **API 调用格式 AST 验证**：`python scripts/validate_api_format.py "results/{target}/{version}/{timestamp}"`
+6. **Target 中立验证**：`python scripts/validate_target_neutrality.py "results/{target}/{version}/{timestamp}"`
+   含与当前 target 不符的 DB 签名（如 target=weaviate 但脚本命中 :6333）的脚本 → 打回 Attack Agent 修改（同 8d.5 打回机制）。
+7. 审查结果写入 `debate_logs/stage1.json`
+8. 脚本路径标准化
+
+**更新 pipeline_state**: `phase` = `"EXECUTION"`, `phases_completed` 追加 `"DEBATE_S1"`, `phase_data.DEBATE_S1` = `{approved_count: N, rejected_count: M}`
+
+### 8d. EXECUTION — 派 Docker Executor + 打回修改
+
+```
+Agent(subagent_type="testvdb:docker-executor", description="执行 {target} v{version} 攻击脚本",
+  prompt="按照 agents/docker-executor.md 规范，在 Docker 沙箱中执行攻击脚本。target={target}, version={version}, SESSION_DIR=${PROJECT_ROOT}/results/{target}/{version}/{timestamp}, session_id={session_id}。⛔ 立即执行 Step 1 命令... \n\n你是 TestVDB 流水线中被主进程派发的子 Agent。禁止使用 Agent 工具派发孙 Agent。")
+```
+
+**验证产出**：`ls results/{target}/{version}/{timestamp}/output_*.log.done 2>/dev/null | wc -l`
+
+**打回修改机制**（8d.5）：
+```bash
+python scripts/scan_script_errors.py "results/{target}/{version}/{timestamp}"
+```
+如有错误 → 派发对应 Attack Agent 修复（最多 2 轮）。
+
+**更新 pipeline_state**: `phase` = `"DEBATE_S2"`, `phases_completed` 追加 `"EXECUTION"`, `phase_data.EXECUTION` = `{scripts_executed: N, scripts_passed: M, scripts_error: K}`
+
+### 8e. DEBATE_S2 — 辩论 Stage 2 + 去重
+
+**阶段 1：先派 judge-doc**
+```
+Agent(subagent_type="testvdb:judge-doc", description="文档契约验证 {target}", ...)
+```
+
+**阶段 2：确认 stage2_doc.json 存在后，并发派其他 3 个 Judge**
+```
+Agent(subagent_type="testvdb:judge-evidence", ..., prompt="...${THREAT_MODEL_JUDGE_EVIDENCE}")
+Agent(subagent_type="testvdb:judge-novelty", ..., prompt="...${THREAT_MODEL_JUDGE_NOVELTY}")
+Agent(subagent_type="testvdb:judge-severity", ..., prompt="...${THREAT_MODEL_JUDGE_SEVERITY}")
+```
+
+**Fallback 机制**：如果任一 Judge 超时，主进程生成默认评估文件。
+
+**投票逻辑和缺陷确认规则**见 `agents/orchestrator.md` Step 8e。
+
+**缺陷去重**（8e.5）：
+```bash
+python scripts/dedup_defects.py "results/{target}/{version}/{timestamp}"
+```
+
+**更新 pipeline_state**: `phase` = `"VERIFY_LIVE"`, `phases_completed` 追加 `"DEBATE_S2"`, `phase_data.DEBATE_S2` = `{debate_confirmed: N, rejected_defects: M}`
+
+### 8e.6. VERIFY_LIVE — L1 机械闸门 + L2 语义闸门
+
+> **设计原则**: L1 纯脚本(0 token)覆盖 ~90% 历史假阳性模式。L2 轻量 Agent 覆盖剩余 ~10% 语义微妙情况。
+
+#### L1 机械闸门
+
+```bash
+python scripts/verify_live_l1.py "results/{target}/{version}/{timestamp}" --target {target}
+```
+
+**产出**: `verify_live_l1.json`。每个候选: REFUTED | UNCERTAIN。
+
+**处理**:
+- 所有 REFUTED: 从 debate_confirmed 列表移除
+- UNCERTAIN > 0: 派发 L2 Agent
+- 全部 REFUTED 且 debate_confirmed 为空: consecutive_no_defect_rounds += 1
+
+#### L2 语义闸门(按需)
+
+```
+Agent(subagent_type="testvdb:verify-live-l2", description="L2 语义闸门 {target}",
+  prompt="按照 agents/verify-live-l2.md 规范，对 verify_live_l1.json 中 UNCERTAIN 候选执行 Docker 实测验证。session_dir=results/{target}/{version}/{timestamp}, target={target}。")
+```
+
+**超时/无产出 fallback（P2-12）**：若 L2 agent 在 maxTurns 内未产出 `verify_live_l2.json`（卡死/超时），主进程有两条降级路径（按此顺序尝试）：
+
+**路径 A — orchestrator-side direct-probe（P0-9 遗留，推荐优先）**：
+主进程直接 curl 实测 UNCERTAIN candidates（非默认全 REFUTED）。比"全 UNCERTAIN→REFUTED"更精确，且不依赖 agent（glm proxy 下 agent 可能不可靠）。
+```bash
+cd "results/{target}/{version}/{timestamp}" && source ./.executor.env
+# 逐 UNCERTAIN candidate: 读脚本核心攻击向量 → curl 实测 → 记录实际 HTTP status + body
+# 例 qdrant: curl -s -X POST "$TESTVDB_DB_URL/collections/<col>/points/search" -H 'Content-Type: application/json' -d '<attack-body>'
+```
+- 实测后写 `verify_live_l2.json`，`generated_by: "orchestrator-direct-probe"`，每 candidate 记 verdict (CONFIRMED/REFUTED/UNCERTAIN) + 实际 HTTP 响应证据
+- HTTP 4xx + 清晰错误诊断 → REFUTED（target 正确拒绝，非 defect）
+- HTTP 2xx 但契约要求拒绝 → CONFIRMED（真 positive）
+- 模棱两可（状态污染/隔离不足）→ UNCERTAIN
+- 见 `agents/verify-live-l2.md` 的 direct-probe 交叉引用
+
+**路径 B — 兜底 UNCERTAIN→REFUTED（保守最后手段）**：
+若 direct-probe 也无法执行（如非 HTTP target、容器不可达），UNCERTAIN 候选视为 REFUTED（保守移除，不进 reporter — 避免未经验证的误报；与 L1 REFUTED 同处理）
+- 升级路径：检查 `.executor.env` 是否 source（P1-8）、Docker 容器是否 healthy（P2-8）、counter-query 是否过复杂
+- L2 是按需闸门（覆盖 ~10% 语义情况），超时降级**不阻塞**流水线
+
+**更新 pipeline_state**: `phase` = `"REPORTING"`, `phases_completed` 追加 `"VERIFY_LIVE"`
+
+### 8f. REPORTING — 派 Reporter
+
+```
+Agent(subagent_type="testvdb:reporter", description="生成缺陷报告 {target}",
+  prompt="按照 agents/reporter.md 规范，为以下 Debate-Confirmed 缺陷生成报告：{debate_confirmed}。session_id={session_id}, target={target}, version={version}, session_dir=results/{target}/{version}/{timestamp}")
+```
+**验证：** `ls results/{target}/{version}/{timestamp}/defects/defect-*.md 2>/dev/null | wc -l`
+
+**更新 pipeline_state**: `phase` = `"DEFECT_REVIEW"`, `phases_completed` 追加 `"REPORTING"`
+
+### 8f.5. DEFECT_REVIEW — 逐缺陷审查
+
+```bash
+python scripts/verify_defects.py "results/{target}/{version}/{timestamp}"
+```
+产出 `defect-review.md`。FALSE_POSITIVE → 删除。NEEDS_IMPROVEMENT → 打回 Reporter 重写（最多 1 次）。
+
+**更新 pipeline_state**: `phase` = `"STATE_SAVE"`, `phases_completed` 追加 `"DEFECT_REVIEW"`
+
+### 8g-8i. STATE_SAVE — 保存状态 + 分析产出 + 终止检查
+
+主进程自行完成：
+
+1. **保存 mine_state.json + coverage.json + experience_handoff.json + pipeline_state.json**
+2. **分析本轮产出**：投票分歧模式、驳回原因分类、endpoint 覆盖率更新、生成 reflection_context
+3. **策略提取**（evolution.enabled=true）：`python scripts/strategy_extractor.py "results/{target}/{version}/{timestamp}" {target}`
+4. **终止条件检查**（任一满足即终止）：
+   - consecutive_no_defect_rounds >= 5
+   - overall_coverage_pct >= 95
+   - current_round >= max_rounds（且 max_rounds > 0）
+   - total_defects_confirmed >= min_defects（且 min_defects > 0；`--min-defects 0` = 无下限，不触发）
+
+**更新 pipeline_state**: `phases_completed` 追加 `"STATE_SAVE"`
+
+### 8j. 轮次间容器管理
+
+- **继续下一轮**：`docker restart testvdb-{target}-${TESTVDB_SESSION_ID:-standalone}`
+- **终止循环**：`docker compose -f docker/{target}.yml down -v`
+
+---
+
+## Final Turn: Cleanup
+
+> 终止条件满足时执行（可能在 Turn 1 或任何 Loop Turn 的末尾触发）。
+
+### Step 9: Issue 草稿 + 汇总 + 清理
+
+#### 9a. 运行 Novelty Gate
+
+**在生成 Issue 草稿前，必须对全部 Debate-Confirmed candidate 运行 Novelty Gate。Gate 产出 Gate-Endorsed（endorsement=true）才是真正可提交的缺陷（ADR-0001）。**
+
+```bash
+python scripts/novelty_gate.py --session-dir results/{target}/{version}/{timestamp}
+```
+
+**Exit code 处理**：
+- `0`（有 NOVEL 背书）→ 继续 9b，仅对 `endorsement=true` 的缺陷生成 Issue 草稿
+- `1`（全拒绝）→ 跳过 Issue 生成，直接生成汇总
+- `2`（有 UNVERIFIED）→ 跳过 Issue 生成，记录警告
+
+**读取 Gate 结果**：
+```bash
+cat results/{target}/{version}/{timestamp}/debate_logs/novelty_gate.json | python -c "
+import json, sys
+data = json.load(sys.stdin)
+endorsed = [d for d, r in data.items() if r.get('endorsement')]
+print(json.dumps({'endorsed_defects': endorsed}, ensure_ascii=False))
+"
+```
+
+#### 9b. 生成 Issue 草稿（仅背书的 NOVEL，candidate 级）
+
+**⛔ 绝对禁止：直接提交 Issue 到 GitHub。所有产出仅限本地文件系统。**
+
+```bash
+mkdir -p results/{target}/{version}/{timestamp}/issues
+```
+
+**粒度映射规则（ADR-0002）**：Novelty Gate 按 candidate/script 级判定（一个 defect 聚合可含多个 candidate，如 defect-2 含 7 个参数）。映射如下：
+- **Issue 草稿**：按 **candidate 级**生成，仅 `endorsement=true` 的 candidate → `issues/issue-{param-slug}-novel.md`。reject 的 candidate **不**生成 issue 草稿。
+- **拒绝清单**：reject 的 candidate 记入 `summary.md` 的「Novelty Gate 拒绝清单」（candidate + param + grade + evidence_url）。`judge_discrepancy=true` 的 candidate 须标注（门控推翻了 judge 的 NOVEL——这是门控核心价值）。
+- **Defect 聚合报告**（`defects/defect-N.md`）仍生成，但头部必须标注门控汇总：含 N candidate，M endorse / (N-M) reject，避免聚合叙事掩盖 candidate 级门控决策。
+
+#### 9b.5 Issue 审核提醒
+
+> ⚠️ **人工审核必需**：Issue 草稿由 AI 生成，需人工审核后手动提交。
+
+#### 9a.6 生成 MRE 脚本（派 reporter-mre）
+
+主进程为通过审查的 Debate-Confirmed 缺陷派发 reporter-mre，生成自包含 MRE 脚本（每个缺陷一个不依赖 TestVDB 代码的独立 Python 脚本）。reporter 专注 defect-N.md 报告，MRE 脚本由 reporter-mre 独立生成（v2.1.1 Reporter 拆分）。
+
+```
+Agent(subagent_type="testvdb:reporter-mre", description="生成 MRE 脚本 {target}",
+  prompt="按照 agents/reporter-mre.md 规范，为以下 Debate-Confirmed 缺陷生成自包含 MRE 脚本：{debate_confirmed}。session_id={session_id}, target={target}, version={version}, session_dir=results/{target}/{version}/{timestamp}")
+```
+
+**验证：** `ls results/{target}/{version}/{timestamp}/mre/defect-*-script.py.done 2>/dev/null | wc -l`（应 ≥1；reporter-mre 完成每个脚本后 `touch .done` 并通过 `py_compile`）
+
+> reporter 的 Pre-Submit Gate 复现验证用 curl 回退（reporter.md 已支持）——MRE 脚本由本步骤的 reporter-mre 独立生成，供外部一键复现。
+
+#### 9b. 生成 summary.md + defect-review.md
+
+#### 9c. 清理
+
+```bash
+# 策略提取（evolution.enabled=true）
+python scripts/strategy_extractor.py "results/{target}/{version}/{timestamp}" {target}
+
+# 容器清理
+docker compose -f docker/{target}.yml down -v --remove-orphans
+docker network rm testvdb-net-${TESTVDB_SESSION_ID:-standalone} 2>/dev/null || true
+
+# 更新状态
+# 更新 .session.lock status 为 completed
+```
+
+### Step 10: 标记完成
+
+更新 `pipeline_state.json`: `phase` = `"DONE"`, `turn_type` = `"done"`
+
+---
+
+## Phase 更新指令
+
+> 每个子步骤完成后，主进程必须执行以下更新。使用 `pipeline_state.py` CLI (ADR-0004)。
+
+### advance — 阶段推进
+
+```bash
+python scripts/pipeline_state.py advance \
+    --session-dir "{session_dir}" \
+    --phase "{NEXT_PHASE}" \
+    --phase-data '{"{COMPLETED_PHASE}": {PHASE_OUTPUT}}'
+```
+
+### mutate — 更新全局状态计数器
+
+```bash
+python scripts/pipeline_state.py mutate \
+    --session-dir "{session_dir}" \
+    --total-defects {total_defects} \
+    --coverage {coverage} \
+    --docker-running {docker_running} \
+    --consecutive-no-defect {consecutive_no_defect}
+```
+
+### status — 查询当前状态
+
+```bash
+python scripts/pipeline_state.py status --session-dir "{session_dir}"
+```
+
+> 等价于原始的手动 JSON 编辑，但提供 seam 校验（无效 phase 转换 → InvalidTransition 报错）。
+
+---
+
+## Termination Conditions
+
+1. **Stalemate**: 连续 5 轮无新缺陷
+2. **Coverage**: 合同覆盖率 ≥ 95%
+3. **Max Rounds**: `--max-rounds` 达到（且 > 0）
+4. **Min Defects**: `--min-defects` 达到（`--min-defects 0` = 无下限，不触发）
+
+## Output
+
+```
+results/{target}/{version}/{timestamp}/
+├── defects/defect-1.md
+├── mre/defect-1-script.py
+├── issues/issue-1-batch-atomicity.md
+├── defect-review.md
+├── summary.md
+├── debate_logs/
+│   ├── stage1.json
+│   ├── stage2_aggregation.json
+│   ├── stage2_deduped.json
+│   ├── stage2_doc.json
+│   ├── stage2_evidence.json
+│   ├── stage2_novelty.json
+│   └── stage2_severity.json
+├── structured_contract.json
+├── mine_state.json
+├── pipeline_state.json     ← v3 跨 Turn 状态机
+├── coverage.json
+├── experience_handoff.json
+└── session_metadata.json
+
+intelligence/{target}/
+├── issue_corpus.json
+├── commit_corpus.json
+├── classified_issues.json
+├── bug_shapes.json
+├── developer_cognition.json
+└── threat_model.json
+```
+
+## Error Recovery
+
+重新运行相同命令可恢复中断的会话。Loop Turn 入口自动检测 `pipeline_state.json` 中的断点并恢复。
+
+## Multi-DB Mining
+
+```bash
+# Terminal 1
+/testvdb:mine milvus v2.4.0
+# Terminal 2
+/testvdb:mine qdrant v1.13.0
+```
