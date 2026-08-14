@@ -8,13 +8,13 @@ from reconstruct_context import reconstruct
 
 
 def _make_session(tmp_path, min_defects, total_defects=0, consecutive=0,
-                  coverage=0.0, max_rounds=0):
+                  coverage=0.0, max_rounds=0, current_round=1):
     """造最小 session tree：results/testdb/1.0/ 含 pipeline_state + contract。"""
     ver = tmp_path / "results" / "testdb" / "1.0"
     ver.mkdir(parents=True)
     ps = {
         "version": 3, "session_id": "s1", "target": "testdb", "version_target": "1.0",
-        "current_round": 1, "max_rounds": max_rounds, "min_defects": min_defects,
+        "current_round": current_round, "max_rounds": max_rounds, "min_defects": min_defects,
         "phase": "ROUND_START", "phases_completed": [],
         "project_root": str(tmp_path), "session_dir": "results/testdb/1.0",
         "global_state": {
@@ -42,8 +42,18 @@ def test_min_defects_zero_means_no_floor(tmp_path):
     assert summary["termination_reason"] == "", summary["termination_reason"]
 
 
-def test_stalemate_still_terminates_with_zero_floor(tmp_path):
-    """min_defects=0 时，僵局（consecutive>=5）仍硬终止。"""
+def test_stalemate_no_longer_terminates(tmp_path):
+    """Experimental build (#3): 僵局（consecutive>=5）不再触发终止，只有轮次上限能停。
+
+    检测能力实验要求跑满轮次，stall 启发式会低估 reach，故已删除该分支。
+    """
     sd = _make_session(tmp_path, min_defects=0, consecutive=5)
     summary = reconstruct(sd)["summary"]
-    assert "僵局" in summary["termination_reason"]
+    assert summary["termination_reason"] == "", summary["termination_reason"]
+
+
+def test_round_cap_still_terminates(tmp_path):
+    """轮次上限是改造后唯一的终止条件，必须仍然生效。"""
+    sd = _make_session(tmp_path, min_defects=0, max_rounds=5, current_round=6)
+    summary = reconstruct(sd)["summary"]
+    assert "最大轮次" in summary["termination_reason"]
