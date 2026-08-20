@@ -101,6 +101,14 @@ def _meta_param(session_dir: str, defect_id: str) -> str:
         p = meta.get("param", "")
         if p:
             return str(p)
+        # Secondary extraction (pilot 2026-08-20): vein metas carry the tested
+        # params in test_parameters dict (keys are dotted param paths) even when
+        # the top-level param field is missing/null.
+        tp = meta.get("test_parameters")
+        if isinstance(tp, dict) and tp:
+            keys = [k for k in tp if not k.endswith("_type")]
+            if keys:
+                return str(keys[0])
     return ""
 
 
