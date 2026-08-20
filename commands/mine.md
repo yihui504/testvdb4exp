@@ -58,7 +58,7 @@ allowed-tools: Read, Write, Bash, Grep, Glob, Agent
 |-----------|----------|---------|-------------|
 | `<db>` | Yes | — | `milvus`, `qdrant`, `weaviate`, `pgvector`, `meilisearch`, 或 `chroma` |
 | `<version>` | Yes | — | 目标版本号 |
-| `--max-rounds N` | No | `5` | 最大挖掘轮数。`0` = 无上限 |
+| `--max-rounds N` | No | `30` | 最大挖掘轮数。`0` = 无上限〔实验版 #1：5→30〕 |
 | `--min-defects N` | No | `1` | 最低缺陷产出要求 |
 | `--intel true\|false` | No | `auto` | 情报阶段控制。`true`=强制重新采集；`false`=禁用采集（C 边界：无情报→报错，有但过期→用+警告）；不传=`auto`（缓存有效→复用，否则采集） |
 | `--contract true\|false` | No | `auto` | 契约阶段控制。`true`=强制重新生成；`false`=禁用生成（C 边界：无契约→报错，有但过期→用+警告）；不传=`auto`（缓存有效→复用，否则生成） |
@@ -505,6 +505,12 @@ docker ps --filter "name=testvdb-{target}" --format "{{.Names}}" 2>/dev/null
 THREAT_MODEL_ATTACK=$(python scripts/threat_model_injector.py {target} --mode attack --text-only 2>/dev/null || echo "")
 ```
 
+**GT-informed 续挖注入**（实验版 #5，仅检测能力实验）：
+```bash
+GT_HINT=$(python scripts/gt_reach_injector.py --session-dir results/{target}/{version}/{timestamp} --text-only 2>/dev/null || echo "")
+```
+> 未设 `TESTVDB_GT_PATH` 且无 `results/{target}/{version}/gt.json` 时 `GT_HINT` 为空串，正常挖掘流程不受影响。注入文本只含"已确认 X/Y + 提升脚本质量/扩大覆盖/深化挖掘"的通用催促，**不含任何端点/参数/预期**（盲注契约见 scripts/gt_reach_injector.py docstring）。confirmed 计数源 = `debate_logs/chain_verdicts.json` 的 DEFECT 条目（ADR-0008 语义，auditor 每轮对累积链全量重判）。
+
 （ADR-0008：Judge 增强注入已随 Judge Quartet 删除；threat_model 仅 --mode attack 注入仍在用。）
 
 ### 8b. ATTACK_GEN — 契约分块 + 并发出动 Attack Trio + Explorer
@@ -519,16 +525,16 @@ python scripts/chunk_contract.py results/{target}/{version}/structured_contract.
 
 ```
 Agent(subagent_type="testvdb:attack-boundary", description="边界攻击 {target} v{version}",
-  prompt="按照 agents/attack-boundary.md 规范，为 {target} v{version} 生成边界攻击脚本。contract=${PROJECT_ROOT}/results/{target}/{version}/structured_contract.json, session_id={session_id}, session_dir=${PROJECT_ROOT}/results/{target}/{version}/{timestamp}, reflection_context={reflection_context}, 本轮块={chunk_id}（块内 unit_ref 清单见 chunks.json，只攻该块内单元）。{THREAT_MODEL_ATTACK}")
+  prompt="按照 agents/attack-boundary.md 规范，为 {target} v{version} 生成边界攻击脚本。contract=${PROJECT_ROOT}/results/{target}/{version}/structured_contract.json, session_id={session_id}, session_dir=${PROJECT_ROOT}/results/{target}/{version}/{timestamp}, reflection_context={reflection_context}, 本轮块={chunk_id}（块内 unit_ref 清单见 chunks.json，只攻该块内单元）。{THREAT_MODEL_ATTACK} {GT_HINT}")
 
 Agent(subagent_type="testvdb:attack-state", description="状态攻击 {target} v{version}",
-  prompt="按照 agents/attack-state.md 规范...（同上格式）{THREAT_MODEL_ATTACK}")
+  prompt="按照 agents/attack-state.md 规范...（同上格式）{THREAT_MODEL_ATTACK} {GT_HINT}")
 
 Agent(subagent_type="testvdb:attack-semantic", description="语义攻击 {target} v{version}",
-  prompt="按照 agents/attack-semantic.md 规范...（同上格式）{THREAT_MODEL_ATTACK}")
+  prompt="按照 agents/attack-semantic.md 规范...（同上格式）{THREAT_MODEL_ATTACK} {GT_HINT}")
 
 Agent(subagent_type="testvdb:attack-vein", description="Vein-mining 纵深攻击 {target} v{version}",
-  prompt="按照 agents/attack-vein.md 规范，为 {target} v{version} 做 condition-space 纵深挖掘。contract=results/{target}/{version}/structured_contract.json, threat_model=${PROJECT_ROOT}/intelligence/{target}/threat_model.json, session_id={session_id}, session_dir=${PROJECT_ROOT}/results/{target}/{version}/{timestamp}。**自己跑脚本**（curl 真 DB via Bash，DB URL 从 TESTVDB_DB_URL 环境变量读），single-turn discover-then-deepen 按 condition-richness 评分选 top-3 endpoint，纵深挖掘 8 类通用 condition（range_filter / compound_and / compound_or / geo_filter / null_check / type_mismatch / collection_membership / pagination_cursor），finding-feedback loop 启发相邻 condition。产出 ${PROJECT_ROOT}/results/{target}/{version}/{timestamp}/vein_scripts/*.py（strategy=vein_<type>，走标准 Stage 1+2+Judge）+ vein_state.json（finding 链）+ vein_summary.json。")
+  prompt="按照 agents/attack-vein.md 规范，为 {target} v{version} 做 condition-space 纵深挖掘。contract=results/{target}/{version}/structured_contract.json, threat_model=${PROJECT_ROOT}/intelligence/{target}/threat_model.json, session_id={session_id}, session_dir=${PROJECT_ROOT}/results/{target}/{version}/{timestamp}。**自己跑脚本**（curl 真 DB via Bash，DB URL 从 TESTVDB_DB_URL 环境变量读），single-turn discover-then-deepen 按 condition-richness 评分选 top-3 endpoint，纵深挖掘 8 类通用 condition（range_filter / compound_and / compound_or / geo_filter / null_check / type_mismatch / collection_membership / pagination_cursor），finding-feedback loop 启发相邻 condition。产出 ${PROJECT_ROOT}/results/{target}/{version}/{timestamp}/vein_scripts/*.py（strategy=vein_<type>，走标准 Stage 1+2+Judge）+ vein_state.json（finding 链）+ vein_summary.json。 {GT_HINT}")
 ```
 
 > **attack-vein 是第 4 个 attack agent**（v2.5，与 boundary/state/semantic 并存）：
@@ -667,9 +673,7 @@ python scripts/verify_defects.py "results/{target}/{version}/{timestamp}"
 1. **保存 mine_state.json + coverage.json + experience_handoff.json + pipeline_state.json**
 2. **分析本轮产出**：投票分歧模式、驳回原因分类、endpoint 覆盖率更新、生成 reflection_context
 3. **策略提取**（evolution.enabled=true）：`python scripts/strategy_extractor.py "results/{target}/{version}/{timestamp}" {target}`
-4. **终止条件检查**（任一满足即终止）：
-   - consecutive_no_defect_rounds >= 5
-   - overall_coverage_pct >= 95
+4. **终止条件检查**（实验版 #2/#3 已删僵局与覆盖率早停，任一满足即终止）：
    - current_round >= max_rounds（且 max_rounds > 0）
    - total_defects_confirmed >= min_defects（且 min_defects > 0；`--min-defects 0` = 无下限，不触发）
 
@@ -804,10 +808,8 @@ python scripts/pipeline_state.py status --session-dir "{session_dir}"
 
 ## Termination Conditions
 
-1. **Stalemate**: 连续 5 轮无新缺陷
-2. **Coverage**: 合同覆盖率 ≥ 95%
-3. **Max Rounds**: `--max-rounds` 达到（且 > 0）
-4. **Min Defects**: `--min-defects` 达到（`--min-defects 0` = 无下限，不触发）
+1. **Max Rounds**: `--max-rounds` 达到（且 > 0）〔实验版 #2/#3：Stalemate（连续 5 轮无新缺陷）与 Coverage（≥95%）早停已删——检测能力实验必须跑满轮次，reach 不得被启发式低估〕
+2. **Min Defects**: `--min-defects` 达到（`--min-defects 0` = 无下限，不触发）
 
 ## Output
 

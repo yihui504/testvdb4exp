@@ -593,7 +593,7 @@ def main():
     p_init = sub.add_parser("init", help="Create fresh pipeline_state.json")
     p_init.add_argument("--target", required=True)
     p_init.add_argument("--version", required=True)
-    p_init.add_argument("--max-rounds", type=int, default=5)
+    p_init.add_argument("--max-rounds", type=int, default=30)  # exp #1: 5→30 (detection-capability run)
     p_init.add_argument("--min-defects", type=int, default=1)
     p_init.add_argument("--session-dir", required=True)
     p_init.add_argument("--project-root", default="")

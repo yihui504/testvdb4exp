@@ -3,7 +3,7 @@ name: attack-semantic
 description: 语义攻击 Agent — 专注于行为契约违规、错误诊断质量和搜索语义正确性的测试生成。
 model: sonnet
 dataAccess: redacted
-maxTurns: 300
+maxTurns: 500
 tools:
   - Read
   - Write

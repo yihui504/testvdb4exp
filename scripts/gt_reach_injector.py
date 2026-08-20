@@ -32,7 +32,6 @@ gt.json format:
 """
 from __future__ import annotations
 
-import glob
 import json
 import os
 import re
@@ -42,7 +41,7 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from _pipeline_utils import setup_encoding, extract_confirmed  # noqa: E402
+from _pipeline_utils import setup_encoding  # noqa: E402
 
 HINT_TEMPLATE = (
     "【GT-informed 续挖】当前会话尚未覆盖全部目标缺陷（已确认 {x}/{y}）。"
@@ -58,19 +57,27 @@ def _norm(s: str) -> str:
 
 
 def _confirmed_params(session_dir: str) -> set:
-    """Normalized param names from the session's stage2 aggregation(s)."""
+    """Normalized param names from the session's chain verdicts.
+
+    ADR-0008 base: the judge quartet + stage2_aggregation is gone; the confirmed
+    set now comes from debate_logs/chain_verdicts.json (chain-auditor's final
+    verdicts). The auditor re-audits the accumulated evidence_chain/ each round
+    (builders append chains; auditor writes the file fresh), so a single read of
+    the latest file already carries cross-round accumulation — no history file
+    needed. DEFECT only; NOT_DEFECT / NEEDS_MORE_EVIDENCE never counted.
+    """
+    cv_path = os.path.join(session_dir, "debate_logs", "chain_verdicts.json")
     params: set = set()
-    for agg_path in glob.glob(
-        os.path.join(session_dir, "**", "stage2_aggregation*.json"), recursive=True
-    ):
-        try:
-            agg = json.load(open(agg_path, encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+    try:
+        cv = json.load(open(cv_path, encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return params
+    for v in cv.get("verdicts", []):
+        if not isinstance(v, dict) or v.get("verdict") != "DEFECT":
             continue
-        for d in extract_confirmed(agg):
-            np = _norm(d.get("param", ""))
-            if np:
-                params.add(np)
+        np = _norm(v.get("param", ""))
+        if np:
+            params.add(np)
     return params
 
 

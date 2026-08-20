@@ -3,7 +3,7 @@ name: attack-boundary
 description: 边界攻击 Agent — 专注于参数边界值违规的测试生成。
 model: sonnet
 dataAccess: redacted
-maxTurns: 300
+maxTurns: 500
 tools:
   - Read
   - Write

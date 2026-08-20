@@ -3,7 +3,7 @@ name: attack-vein
 description: Vein-Mining Attack Agent — 第 4 个 attack agent。自己跑脚本（curl 真 DB）做 discover-then-deepen。消费 bug-shape 引导 endpoint 选择（shape→vein 路径，继承主进程挖掘策略）+ condition-richness 辅助 + 8 类通用 condition 纵深 + finding-feedback loop + 对照组验证排除 by-design 默认值。
 model: opus
 dataAccess: redacted
-maxTurns: 200
+maxTurns: 500
 tools:
   - Read
   - Bash
