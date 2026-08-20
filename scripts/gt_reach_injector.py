@@ -78,7 +78,30 @@ def _confirmed_params(session_dir: str) -> set:
         np = _norm(v.get("param", ""))
         if np:
             params.add(np)
+            continue
+        # Fallback (pilot 2026-08-20): chain-auditor verdicts carry no param
+        # field; recover it from the attack agent's .meta.json next to the
+        # script (debate_logs/<defect_id>.meta.json / vein_scripts/).
+        np = _norm(_meta_param(session_dir, v.get("defect_id", "")))
+        if np:
+            params.add(np)
     return params
+
+
+def _meta_param(session_dir: str, defect_id: str) -> str:
+    """param field from the attack agent's .meta.json for defect_id (or "")."""
+    if not defect_id:
+        return ""
+    for sub in ("debate_logs", "vein_scripts"):
+        meta_path = os.path.join(session_dir, sub, defect_id + ".meta.json")
+        try:
+            meta = json.load(open(meta_path, encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        p = meta.get("param", "")
+        if p:
+            return str(p)
+    return ""
 
 
 def _noop(text_only: bool) -> int:
