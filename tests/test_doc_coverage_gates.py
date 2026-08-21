@@ -125,3 +125,43 @@ class TestMetaParamSecondaryExtraction:
         """防误匹配：vector 不得命中 vectors.size（vectorssize）。"""
         from gt_reach_injector import _reached, _norm
         assert not _reached(_norm("vector"), {"vectorssize"})
+
+
+# ═══════════════════════════════════════════════════════════════
+# chain_verdicts 双形态兼容（fullrun#5 R1 2026-08-21：旧直写根下+final_verdict）
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestChainVerdictsDualForm:
+    def _make_session(self, tmp_path, verdict_key, at_root):
+        """构造 session：verdicts 用指定字段名，文件落 debate_logs/ 或根。"""
+        sd = tmp_path
+        (sd / "debate_logs").mkdir(exist_ok=True)
+        (sd / "debate_logs" / "x_001.meta.json").write_text(
+            json.dumps({"param": "tokenization"}), encoding="utf-8")
+        cv = {"verdicts": [
+            {"defect_id": "x_001", verdict_key: "DEFECT"},
+            {"defect_id": "x_002", verdict_key: "NOT_DEFECT"},
+        ]}
+        target = sd if at_root else sd / "debate_logs"
+        (target / "chain_verdicts.json").write_text(
+            json.dumps(cv), encoding="utf-8")
+        return str(sd)
+
+    def test_root_final_verdict_form(self, tmp_path):
+        """fullrun#5 R1 实况：auditor 旧直写落 session 根 + final_verdict 字段。"""
+        from gt_reach_injector import _confirmed_params
+        params = _confirmed_params(self._make_session(tmp_path, "final_verdict", at_root=True))
+        assert params == {"tokenization"}
+
+    def test_debate_logs_verdict_form(self, tmp_path):
+        """fullrun#4 两段式转写形态：debate_logs/ + verdict 字段。"""
+        from gt_reach_injector import _confirmed_params
+        params = _confirmed_params(self._make_session(tmp_path, "verdict", at_root=False))
+        assert params == {"tokenization"}
+
+    def test_debate_logs_final_verdict_form(self, tmp_path):
+        """交叉形态防漏：debate_logs/ 下也可能出现 final_verdict。"""
+        from gt_reach_injector import _confirmed_params
+        params = _confirmed_params(self._make_session(tmp_path, "final_verdict", at_root=False))
+        assert params == {"tokenization"}

@@ -79,14 +79,19 @@ def _confirmed_params(session_dir: str) -> set:
     the latest file already carries cross-round accumulation — no history file
     needed. DEFECT only; NOT_DEFECT / NEEDS_MORE_EVIDENCE never counted.
     """
+    # 两个落点都找：两段式主进程转写落 debate_logs/，auditor 旧长报告直写落
+    # session 根（fullrun#5 R1 实测两种形态并存）
     cv_path = os.path.join(session_dir, "debate_logs", "chain_verdicts.json")
+    if not os.path.isfile(cv_path):
+        cv_path = os.path.join(session_dir, "chain_verdicts.json")
     params: set = set()
     try:
         cv = json.load(open(cv_path, encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return params
     for v in cv.get("verdicts", []):
-        if not isinstance(v, dict) or v.get("verdict") != "DEFECT":
+        # verdict（两段式转写）或 final_verdict（auditor 旧长报告直写）
+        if not isinstance(v, dict) or (v.get("verdict") or v.get("final_verdict")) != "DEFECT":
             continue
         np = _norm(v.get("param", ""))
         if np:
