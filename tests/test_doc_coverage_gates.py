@@ -165,3 +165,12 @@ class TestChainVerdictsDualForm:
         from gt_reach_injector import _confirmed_params
         params = _confirmed_params(self._make_session(tmp_path, "final_verdict", at_root=False))
         assert params == {"tokenization"}
+
+
+    def test_sharding_config_prefix(self):
+        """fullrun#6：GT 裸名 desiredCount vs agent "shardingConfig.desiredCount"."""
+        from gt_reach_injector import _reached, _norm, _norm_multi
+        assert _reached(_norm("desiredCount"), _norm_multi("shardingConfig.desiredCount"))
+        assert _reached(_norm("distance"), _norm_multi("vectorIndexConfig.distance"))
+        # 防误匹配：desiredCount 不得命中无关容器
+        assert not _reached(_norm("count"), _norm_multi("shardingConfig.desiredCount"))

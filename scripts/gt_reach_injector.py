@@ -156,7 +156,11 @@ def _reached(gt_norm: str, confirmed: set) -> bool:
                 return True
             # 容器前缀对齐（fullrun#1 2026-08-21 补 points：agent 写
             # "points[].vector" 归一为 pointsvector，GT 裸名 vector）
-            for pref in ("params", "hnswconfig", "vectors", "filter", "config", "points"):
+            # fullrun#6 2026-08-21 补 shardingconfig：GT 裸名 desiredCount vs
+            # agent meta "shardingConfig.desiredCount"（boundary 首个实测命中）
+            for pref in ("params", "hnswconfig", "vectors", "filter", "config", "points",
+                         "shardingconfig", "vectorindexconfig", "invertedindexconfig",
+                         "replicationconfig", "multitenancyconfig"):
                 if part == pref + gt_norm:
                     return True
     return False
