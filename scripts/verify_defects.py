@@ -51,7 +51,9 @@ def extract_verdict_from_log(log_path):
         return []
     verdicts = []
     for line in content.split("\n"):
-        if "VERDICT" in line.upper() and ":" in line:
+        # fullrun#10 2026-08-22：兼容 boundary 族 VERDICT_DEFECT 下划线格式
+        # （无冒号）；判定要素=行含 VERDICT 且含 DEFECT/NOD 染色词
+        if "VERDICT" in line.upper() and ("DEFECT" in line.upper()):
             verdicts.append(line.strip())
     return verdicts
 
