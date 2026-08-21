@@ -160,7 +160,10 @@ def _reached(gt_norm: str, confirmed: set) -> bool:
             # agent meta "shardingConfig.desiredCount"（boundary 首个实测命中）
             for pref in ("params", "hnswconfig", "vectors", "filter", "config", "points",
                          "shardingconfig", "vectorindexconfig", "invertedindexconfig",
-                         "replicationconfig", "multitenancyconfig"):
+                         "replicationconfig", "multitenancyconfig",
+                         # fullrun#9 2026-08-22 补 searchparams/输出容器：GT 裸名 ef vs
+                         # agent meta "searchParams.ef"（vein_searchparams_silent_default_3 实测）
+                         "searchparams", "outputfields", "data", "schema", "indexparams"):
                 if part == pref + gt_norm:
                     return True
     return False
