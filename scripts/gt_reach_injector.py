@@ -56,6 +56,16 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
+def _norm_multi(s: str) -> set:
+    """多值 param（agent meta 可能写 "a,b"）归一化拆分（rerun pilot 2026-08-21）。
+
+    _norm 会把逗号剔掉导致 "replication_factor,shard_number" 变连体词，
+    GT 裸名 shard_number 永远对不上。这里按逗号/分号拆开各自 _norm。
+    """
+    raw = (s or "").replace(";", ",")
+    return {_norm(part) for part in raw.split(",") if _norm(part)}
+
+
 def _confirmed_params(session_dir: str) -> set:
     """Normalized param names from the session's chain verdicts.
 
@@ -77,14 +87,14 @@ def _confirmed_params(session_dir: str) -> set:
             continue
         np = _norm(v.get("param", ""))
         if np:
-            params.add(np)
+            params |= _norm_multi(v.get("param", ""))
             continue
         # Fallback (pilot 2026-08-20): chain-auditor verdicts carry no param
         # field; recover it from the attack agent's .meta.json next to the
         # script (debate_logs/<defect_id>.meta.json / vein_scripts/).
         np = _norm(_meta_param(session_dir, v.get("defect_id", "")))
         if np:
-            params.add(np)
+            params |= _norm_multi(_meta_param(session_dir, v.get("defect_id", "")))
     return params
 
 
@@ -115,6 +125,31 @@ def _meta_param(session_dir: str, defect_id: str) -> str:
 def _noop(text_only: bool) -> int:
     print("" if text_only else "{}")
     return 0
+
+
+def _reached(gt_norm: str, confirmed: set) -> bool:
+    """GT param 是否被 confirmed 覆盖（rerun pilot 2026-08-21 匹配粒度修复）。
+
+    三种对齐（GT param 是裸名如 hnsw_ef，agent meta param 可能是路径/多值）：
+    1. 精确：gt_norm in confirmed
+    2. 路径后缀：confirmed 项是 "paramshnswef" 这类归一化路径（params.hnsw_ef），
+       按 gt_norm 做带容器前缀的后缀对齐（白名单容器名防误匹配）
+    3. 多值拆分：confirmed 项含逗号（replication_factor,shard_number），拆各段
+       各自做 1/2 对齐
+    """
+    if not gt_norm:
+        return False
+    for c in confirmed:
+        if c == gt_norm:
+            return True
+        for part in c.split(","):
+            part = part.strip()
+            if part == gt_norm:
+                return True
+            for pref in ("params", "hnswconfig", "vectors", "filter", "config"):
+                if part == pref + gt_norm:
+                    return True
+    return False
 
 
 def main() -> int:
@@ -155,7 +190,7 @@ def main() -> int:
 
     confirmed = _confirmed_params(session_dir)
     y = len(bugs)
-    x = sum(1 for b in bugs if (np := _norm(b.get("param", ""))) and np in confirmed)
+    x = sum(1 for b in bugs if (np := _norm(b.get("param", ""))) and _reached(np, confirmed))
 
     if x >= y:
         # All reached — stop nudging; the round cap ends the run.
