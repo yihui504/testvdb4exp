@@ -57,12 +57,15 @@ def _norm(s: str) -> str:
 
 
 def _norm_multi(s: str) -> set:
-    """多值 param（agent meta 可能写 "a,b"）归一化拆分（rerun pilot 2026-08-21）。
+    """多值/复合 param 归一化拆分（rerun pilot 2026-08-21 + fullrun#1 2026-08-21）。
 
-    _norm 会把逗号剔掉导致 "replication_factor,shard_number" 变连体词，
-    GT 裸名 shard_number 永远对不上。这里按逗号/分号拆开各自 _norm。
+    两类 agent meta 形态在此剥开，否则 GT 裸名对不上：
+    1. 逗号/分号多值："replication_factor,shard_number"（_norm 剔逗号成连体词）
+    2. 带说明括号："points[].vector (dimension)" → 取括号前的路径部分
+       （fullrun#1 实测 GT 裸名 vector 因 "(dimension)" 后缀未命中）
     """
     raw = (s or "").replace(";", ",")
+    raw = re.sub(r"\([^)]*\)", "", raw)  # 剥说明括号（dimension/empty array 等）
     return {_norm(part) for part in raw.split(",") if _norm(part)}
 
 
@@ -146,7 +149,9 @@ def _reached(gt_norm: str, confirmed: set) -> bool:
             part = part.strip()
             if part == gt_norm:
                 return True
-            for pref in ("params", "hnswconfig", "vectors", "filter", "config"):
+            # 容器前缀对齐（fullrun#1 2026-08-21 补 points：agent 写
+            # "points[].vector" 归一为 pointsvector，GT 裸名 vector）
+            for pref in ("params", "hnswconfig", "vectors", "filter", "config", "points"):
                 if part == pref + gt_norm:
                     return True
     return False

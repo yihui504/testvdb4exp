@@ -107,3 +107,21 @@ class TestMetaParamSecondaryExtraction:
 
     def test_missing_meta_returns_empty(self, tmp_path):
         assert _meta_param(str(tmp_path), "nope") == ""
+
+    def test_paren_annotation_stripped(self):
+        """fullrun#1：agent meta "points[].vector (dimension)" 带说明括号——剥后可命中 GT 裸名。"""
+        from gt_reach_injector import _norm_multi, _reached, _norm
+        parts = _norm_multi("points[].vector (dimension)")
+        assert parts == {"pointsvector"}
+        assert _reached(_norm("vector"), parts)
+
+    def test_points_prefix_alignment(self):
+        """points[].vector 归一为 pointsvector——容器前缀 points 对齐 GT 裸名 vector。"""
+        from gt_reach_injector import _reached, _norm
+        assert _reached(_norm("vector"), {"pointsvector"})
+        assert _reached(_norm("vector"), {"pointsvector", "wait"})
+
+    def test_no_false_match_vectorsize(self):
+        """防误匹配：vector 不得命中 vectors.size（vectorssize）。"""
+        from gt_reach_injector import _reached, _norm
+        assert not _reached(_norm("vector"), {"vectorssize"})
